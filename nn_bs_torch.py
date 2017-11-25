@@ -72,7 +72,7 @@ class NN(object):
     self.test_examples = test_examples
     self.nonlin = nonlin
     self.update = update
-    self.alpha = 0.0
+    self.alpha = alpha
 
     self.lr_init = 1e-3
     self.eps = 1e-6
@@ -101,7 +101,7 @@ class NN(object):
     self.sum_dW2.append(torch.zeros([self.num_classes, self.hidden_dim]).type(dtype))
     self.sum_db2.append(torch.zeros(self.num_classes).type(dtype))
 
-    if self.update != 'simple' and self.update != 'simple_backstitch':
+    if self.update == 'natural':
       # moving estimates of inverse Fisher matrices
       self.inv_F = [torch.eye(self.hidden_dim * (self.input_dim if i == 0
           else self.hidden_dim) + self.hidden_dim).type(torch.FloatTensor)
@@ -154,7 +154,7 @@ class NN(object):
       return out_value, accuracy
     return out_value
 
-  def Backprop(self, out_value, out_deriv, learning_rate, iter):
+  def Backprop(self, out_value, out_deriv, learning_rate, iter, backstitch_step1=False):
     cur_batch_size = out_value.shape[0]
     assert cur_batch_size == out_deriv.shape[0]
     in_deriv = LogSoftMaxBackprop(out_value, out_deriv)
@@ -162,7 +162,8 @@ class NN(object):
     out_deriv = in_deriv
     in_deriv, W_deriv, b_deriv = AffineBackprop(self.W[-1], self.b[-1],
                                                 in_value, out_deriv)
-    self.UpdateParams(self.num_layers, W_deriv, b_deriv, learning_rate, iter)
+    self.UpdateParams(self.num_layers, W_deriv, b_deriv, learning_rate, iter,
+                      backstitch_step1=backstitch_step1)
     for i in range(self.num_layers)[::-1]:
       out_value = in_value
       out_deriv = in_deriv
@@ -171,7 +172,8 @@ class NN(object):
       out_deriv = in_deriv
       in_deriv, W_deriv, b_deriv = AffineBackprop(self.W[i], self.b[i],
                                                   in_value, out_deriv)
-      self.UpdateParams(i, W_deriv, b_deriv, learning_rate, iter)
+      self.UpdateParams(i, W_deriv, b_deriv, learning_rate, iter,
+                        backstitch_step1=backstitch_step1)
     return in_deriv
 
   def UpdateParamsSimple(self, i, W_deriv, b_deriv, learning_rate, iter):
@@ -190,15 +192,13 @@ class NN(object):
     self.W[i].sub_(learning_rate * self.sum_dW[i] / (np.sqrt(sum_dW2_hat[i]) + epsilon))
     self.b[i].sub_(learning_rate * self.sum_db[i] / (np.sqrt(sum_db2_hat[i]) + epsilon))
     '''
-    self.W[i].sub_(learning_rate * W_deriv)
-    self.b[i].sub_(learning_rate * b_deriv)
+    self.W[i].sub_(learning_rate * (1.0 + self.alpha) * W_deriv)
+    self.b[i].sub_(learning_rate * (1.0 + self.alpha) * b_deriv)
     '''
 
   def UpdateParamsSimpleBackstitch(self, i, W_deriv, b_deriv, learning_rate):
-    self.W[i] += learning_rate * alpha * W_deriv
-    self.b[i] += learning_rate * alpha * b_deriv
-    self.W[i] -= learning_rate * (1.0 + alpha) * W_deriv
-    self.b[i] -= learning_rate * (1.0 + alpha) * b_deriv
+    self.W[i] += learning_rate * self.alpha * W_deriv
+    self.b[i] += learning_rate * self.alpha * b_deriv
 
   def __MatrixCuVectorMulCu(self, M_cpu, v_cuda):
     assert M_cpu.shape[1] == v_cuda.shape[0]
@@ -222,8 +222,8 @@ class NN(object):
     #natural_deriv = torch.mv(self.inv_F[i], deriv_concat)
     natural_deriv = self.__MatrixCuVectorMulCu(self.inv_F[i], deriv_concat)
     natural_deriv.mul_(torch.norm(deriv_concat) / torch.norm(natural_deriv))
-    self.W[i].sub_(learning_rate * natural_deriv[:W_deriv.numel()].view_as(W_deriv))
-    self.b[i].sub_(learning_rate * natural_deriv[W_deriv.numel():])
+    self.W[i].sub_(learning_rate * (1.0 + self.alpha) * natural_deriv[:W_deriv.numel()].view_as(W_deriv))
+    self.b[i].sub_(learning_rate * (1.0 + self.alpha) * natural_deriv[W_deriv.numel():])
     gamma = 0.001
     #print(torch.mean(torch.abs(self.inv_F[i])), torch.mean(torch.abs(deriv_concat))) ##
     #self.inv_F[i].mul_(1.0 / (1.0 - gamma))
@@ -247,32 +247,23 @@ class NN(object):
     self.inv_F[i].sub_(torch.ger(inv_F_a_cpu, inv_F_a_cpu))
     
   def UpdateParamsNaturalBackstitch(self, i, W_deriv, b_deriv, learning_rate):
-    deriv_concat = np.concatenate((np.reshape(W_deriv, (-1)), b_deriv))
-    natural_deriv = np.dot(self.inv_F[i], deriv_concat)
-    natural_deriv *= (np.linalg.norm(deriv_concat) /
-                      np.linalg.norm(natural_deriv))
-    self.W[i] += learning_rate * alpha * np.reshape(
-        natural_deriv[:W_deriv.size], W_deriv.shape)
-    self.b[i] += learning_rate * alpha * natural_deriv[W_deriv.size:]
-    self.W[i] -= learning_rate * (1.0 - alpha) * np.reshape(
-        natural_deriv[:W_deriv.size], W_deriv.shape)
-    self.b[i] -= learning_rate * (1.0 - alpha) * natural_deriv[W_deriv.size:]
-    S = 2000
-    gamma = 1.0 - np.exp(float(-self.batch_size) / S)
-    self.inv_F[i] *= 1.0 / (1.0 - gamma)
-    u = np.sqrt(gamma) * deriv_concat
-    inv_F_u = np.dot(self.inv_F[i], u)
-    self.inv_F[i] = self.inv_F[i] - np.outer(inv_F_u, inv_F_u) / (1 +
-        np.dot(np.dot(u, self.inv_F[i]), u))
+    #assert (self.inv_F[i] == self.inv_F[i].t()).all() ### 
+    deriv_concat = torch.cat((W_deriv.view(-1), b_deriv))
+    #natural_deriv = torch.mv(self.inv_F[i], deriv_concat)
+    natural_deriv = self.__MatrixCuVectorMulCu(self.inv_F[i], deriv_concat)
+    natural_deriv.mul_(torch.norm(deriv_concat) / torch.norm(natural_deriv))
+    self.W[i].add_(learning_rate * self.alpha *
+        natural_deriv[:W_deriv.numel()].view_as(W_deriv))
+    self.b[i].add_(learning_rate * self.alpha * natural_deriv[W_deriv.numel():])
  
-  def UpdateParams(self, i, W_deriv, b_deriv, learning_rate, iter):
+  def UpdateParams(self, i, W_deriv, b_deriv, learning_rate, iter, backstitch_step1=False):
     if self.update == 'simple':
-      return self.UpdateParamsSimple(i, W_deriv, b_deriv, learning_rate, iter)
-    elif self.update == 'simple_backstitch':
-      return self.UpdateParamsSimpleBackstitch(i, W_deriv, b_deriv, learning_rate)
+      if not backstitch_step1:
+        return self.UpdateParamsSimple(i, W_deriv, b_deriv, learning_rate, iter)
+      return self.UpdateParamsSimpleBackstitch(i, W_deriv, b_deriv, learning_rate, iter)
     elif self.update == 'natural':
-      return self.UpdateParamsNatural(i, W_deriv, b_deriv, learning_rate)
-    elif self.update == 'natural_backstitch':
+      if not backstitch_step1:
+        return self.UpdateParamsNatural(i, W_deriv, b_deriv, learning_rate)
       return self.UpdateParamsNaturalBackstitch(i, W_deriv, b_deriv, learning_rate)
  
   # examples is a 2-tuple (images, labels)
@@ -305,8 +296,11 @@ class NN(object):
       Y = torch.zeros([cur_batch_size, self.num_classes]).type(dtype)
       # -1 since we are minimizing the loss
       Y[torch.arange(0, cur_batch_size).type(idtype), examples[1][idx]] = -1
+      if self.alpha > 0.0:
+        out_value = self.Propagate(X)
+        self.Backprop(out_value, Y, lr, iter, backstitch_step1=True)
       out_value = self.Propagate(X)
-      self.Backprop(out_value, Y, lr, iter)
+      self.Backprop(out_value, Y, lr, iter, backstitch_step1=False)
       iter += 1
       temp1, temp2 = self.Propagate(examples[0], examples[1], test_mode=True) ###
       temp3 = -torch.sum(temp1[torch.arange(0, num_examples).type(idtype), examples[1]]) / num_examples ##
@@ -347,6 +341,8 @@ def main():
   np.random.seed(0)
   torch.manual_seed(0)
   p = 1.0
+  backstitch_alpha = 0.3
+  print("backstitch alpha: " + str(backstitch_alpha))
   ratio = 0.5
   training_subset = training_set[np.random.binomial(1, p,
                                                     len(training_set)) == 1]
@@ -373,7 +369,8 @@ def main():
 
   nnet = NN(num_layers=1, input_dim=training_images.shape[1],
             hidden_dim=hidden_dim, num_classes=10, batch_size=batch_size,
-            test_examples=testing_examples, nonlin='Tanh', update='natural')
+            test_examples=testing_examples, nonlin='Tanh', update='natural',
+            alpha=backstitch_alpha)
   nnet.Train(training_examples)
 
 if __name__ == "__main__":

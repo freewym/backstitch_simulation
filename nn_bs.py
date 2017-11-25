@@ -66,7 +66,7 @@ class NN(object):
     self.test_examples = test_examples
     self.nonlin = nonlin
     self.update = update
-    self.alpha = 0.0
+    self.alpha = alpha
 
     self.lr_init = 1e-3
     self.eps = 1e-6
@@ -95,7 +95,7 @@ class NN(object):
     self.sum_dW2.append(np.zeros([self.num_classes, self.hidden_dim]))
     self.sum_db2.append(np.zeros(self.num_classes))
 
-    if self.update != 'simple' and self.update != 'simple_backstitch':
+    if self.update == 'natural':
       # moving estimates of inverse Fisher matrices
       self.inv_F = [np.identity(self.hidden_dim * (self.input_dim if i == 0
           else self.hidden_dim) + self.hidden_dim)
@@ -184,15 +184,13 @@ class NN(object):
     self.W[i] -= learning_rate * self.sum_dW[i] / (np.sqrt(sum_dW2_hat[i]) + epsilon)
     self.b[i] -= learning_rate * self.sum_db[i] / (np.sqrt(sum_db2_hat[i]) + epsilon)
     '''
-    self.W[i] -= learning_rate * W_deriv
-    self.b[i] -= learning_rate * b_deriv
+    self.W[i] -= learning_rate * (1.0 + self.alpha) * W_deriv
+    self.b[i] -= learning_rate * (1.0 + self.alpha) * b_deriv
     '''
 
   def UpdateParamsSimpleBackstitch(self, i, W_deriv, b_deriv, learning_rate):
-    self.W[i] += learning_rate * alpha * W_deriv
-    self.b[i] += learning_rate * alpha * b_deriv
-    self.W[i] -= learning_rate * (1.0 + alpha) * W_deriv
-    self.b[i] -= learning_rate * (1.0 + alpha) * b_deriv
+    self.W[i] += learning_rate * self.alpha * W_deriv
+    self.b[i] += learning_rate * self.alpha * b_deriv
 
   # first update the parameters with inverse fisher estimated from previous
   # examples, then update the inverse fisher.
@@ -232,28 +230,18 @@ class NN(object):
     natural_deriv = np.dot(self.inv_F[i], deriv_concat)
     natural_deriv *= (np.linalg.norm(deriv_concat) /
                       np.linalg.norm(natural_deriv))
-    self.W[i] += learning_rate * alpha * np.reshape(
+    self.W[i] += learning_rate * self.alpha * np.reshape(
         natural_deriv[:W_deriv.size], W_deriv.shape)
-    self.b[i] += learning_rate * alpha * natural_deriv[W_deriv.size:]
-    self.W[i] -= learning_rate * (1.0 - alpha) * np.reshape(
-        natural_deriv[:W_deriv.size], W_deriv.shape)
-    self.b[i] -= learning_rate * (1.0 - alpha) * natural_deriv[W_deriv.size:]
-    S = 2000
-    gamma = 1.0 - np.exp(float(-self.batch_size) / S)
-    self.inv_F[i] *= 1.0 / (1.0 - gamma)
-    u = np.sqrt(gamma) * deriv_concat
-    inv_F_u = np.dot(self.inv_F[i], u)
-    self.inv_F[i] = self.inv_F[i] - np.outer(inv_F_u, inv_F_u) / (1 +
-        np.dot(np.dot(u, self.inv_F[i]), u))
+    self.b[i] += learning_rate * self.alpha * natural_deriv[W_deriv.size:]
  
-  def UpdateParams(self, i, W_deriv, b_deriv, learning_rate, iter):
+  def UpdateParams(self, i, W_deriv, b_deriv, learning_rate, iter, backstitch_step1=False):
     if self.update == 'simple':
-      return self.UpdateParamsSimple(i, W_deriv, b_deriv, learning_rate, iter)
-    elif self.update == 'simple_backstitch':
-      return self.UpdateParamsSimpleBackstitch(i, W_deriv, b_deriv, learning_rate)
+      if not backstitch_step1:
+        return self.UpdateParamsSimple(i, W_deriv, b_deriv, learning_rate, iter)
+      return self.UpdateParamsSimpleBackstitch(i, W_deriv, b_deriv, learning_rate, iter)
     elif self.update == 'natural':
-      return self.UpdateParamsNatural(i, W_deriv, b_deriv, learning_rate)
-    elif self.update == 'natural_backstitch':
+      if not backstitch_step1:
+        return self.UpdateParamsNatural(i, W_deriv, b_deriv, learning_rate)
       return self.UpdateParamsNaturalBackstitch(i, W_deriv, b_deriv, learning_rate)
  
   # examples is a 2-tuple (images, labels)
@@ -283,6 +271,11 @@ class NN(object):
           (iter % num_iters_per_epoch) * self.batch_size + cur_batch_size]
       X = examples[0][idx, :]
       Y = np.zeros([cur_batch_size, self.num_classes])
+      if self.alpha > 0.0:
+        out_value = self.Propagate(X)
+        self.Backprop(out_value, Y, lr, iter, backstitch_step1=True)
+      out_value = self.Propagate(X)
+      self.Backprop(out_value, Y, lr, iter, backstitch_step1=False)
       # -1 since we are minimizing the loss
       Y[range(cur_batch_size), examples[1][idx]] = -1
       out_value = self.Propagate(X)
@@ -326,6 +319,8 @@ def main():
   print("size of the testing set: " + str(len(testing_set)))
   np.random.seed(0)
   p = 1.0
+  backstitch_alpha = 0.3
+  print("backstitch alpha: " + str(backstitch_alpha))
   ratio = 0.5
   training_subset = training_set[np.random.binomial(1, p,
                                                     len(training_set)) == 1]
@@ -350,7 +345,8 @@ def main():
 
   nnet = NN(num_layers=1, input_dim=training_images.shape[1],
             hidden_dim=hidden_dim, num_classes=10, batch_size=batch_size,
-            test_examples=testing_examples, nonlin='Tanh', update='natural')
+            test_examples=testing_examples, nonlin='Tanh', update='natural',
+            alpha=backstitch_alpha)
   nnet.Train(training_examples)
 
 if __name__ == "__main__":
