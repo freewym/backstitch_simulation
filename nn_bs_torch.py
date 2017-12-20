@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 
 import os
+import argparse
 import numpy as np
 from scipy import ndimage
 import mnist
 import torch
+import pickle
 
 #dtype = torch.FloatTensor
 dtype = torch.cuda.FloatTensor
@@ -74,9 +76,10 @@ class NN(object):
     self.update = update
     self.alpha = alpha
 
-    self.lr_init = 1e-3
     self.eps = 1e-6
-    self.decay = 1e-4
+    self.decay = 1e-3
+    self.cur_lr = 1e-1
+    self.cur_iter = 0
 
     # trainable parameters
     self.W = [torch.randn(self.hidden_dim,
@@ -271,13 +274,13 @@ class NN(object):
     num_examples = examples[0].shape[0]
     assert num_examples == examples[1].shape[0]
     assert examples[0].shape[1] == self.input_dim
-    lr_init = 1e-1
-    eps = 1e-6
-    decay = 1e-3
-    iter = 0
+    #lr_init = self.lr_init
+    eps = self.eps
+    decay = self.decay
+    iter = self.cur_iter
     train_loss = float('Inf')
     num_iters_per_epoch = int(np.ceil(float(num_examples) / self.batch_size))
-    lr = lr_init #########
+    lr = self.cur_lr #########
     while (iter == 0 or iter % num_iters_per_epoch != 0 or
         iter // num_iters_per_epoch == 1 or
         abs((train_loss_prev - train_loss) / train_loss_prev) >= eps):
@@ -302,6 +305,7 @@ class NN(object):
       out_value = self.Propagate(X)
       self.Backprop(out_value, Y, lr, iter, backstitch_step1=False)
       iter += 1
+      self.cur_iter = iter
       temp1, temp2 = self.Propagate(examples[0], examples[1], test_mode=True) ###
       temp3 = -torch.sum(temp1[torch.arange(0, num_examples).type(idtype), examples[1]]) / num_examples ##
       print("epoch " + str(epoch) + ####
@@ -326,11 +330,47 @@ class NN(object):
               ", test_accuracy=" + str(test_accuracy))
         if epoch > 0 and (train_loss - train_loss_prev) / abs(train_loss_prev) > 0: ####
           lr /= 2.0  ###
+        self.cur_lr = lr
+        pickle_out = open("model.pickle","wb")
+        pickle.dump(self, pickle_out)
+        pickle_out.close()
 
+def str_to_bool(value):
+  if value == "true":
+    return True
+  elif value == "false":
+    return False
+  else:
+    raise ValueError
+
+class StrToBoolAction(argparse.Action):
+  """ A custom action to convert bools from shell format i.e., true/false
+  to python format i.e., True/False """
+
+  def __call__(self, parser, namespace, values, option_string=None):
+    try:
+      setattr(namespace, self.dest, str_to_bool(values))
+    except ValueError:
+      raise Exception("Unknown value {0} for --{1}".format(values, self.dest))
 
 def main():
-  hidden_dim = 200
-  batch_size = 100
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--hidden-dim", type=int, dest='hidden_dim', default=200)
+  parser.add_argument("--batch-size", type=int, dest='batch_size', default=100)
+  parser.add_argument("--data-percentage", type=float, dest='data_percentage',
+                      default=1.0)
+  parser.add_argument("--backstitch-alpha", type=float, dest='backstitch_alpha',
+                      default=0.2)
+  parser.add_argument("--ratio", type=float, dest='ratio', default=0.5)
+  parser.add_argument("--load-pickle", type=str, dest='load_pickle',
+                      default=False, action=StrToBoolAction,
+                      choices=["true", "false"])
+  parser.add_argument("--gpu", type=int, dest='gpu', default=None)
+
+  args = parser.parse_args()
+  torch.cuda.set_device(args.gpu)
+  hidden_dim = args.hidden_dim
+  batch_size = args.batch_size
   print("hidden_dim: " + str(hidden_dim) + ", batch_size: " + str(batch_size))
   training_set = np.array(list(mnist.read(dataset="training",
                                           path="/home/ywang/mnist")))
@@ -340,10 +380,10 @@ def main():
   print("size of the testing set: " + str(len(testing_set)))
   np.random.seed(0)
   torch.manual_seed(0)
-  p = 1.0
-  backstitch_alpha = 0.3
+  p = args.data_percentage
+  backstitch_alpha = args.backstitch_alpha
   print("backstitch alpha: " + str(backstitch_alpha))
-  ratio = 0.5
+  ratio = args.ratio
   training_subset = training_set[np.random.binomial(1, p,
                                                     len(training_set)) == 1]
   print("number of the actual training examples: " + str(len(training_subset)))
@@ -367,10 +407,15 @@ def main():
   testing_examples = (torch.from_numpy(testing_images).type(dtype),
                       torch.from_numpy(testing_labels.astype('int16')).type(idtype))
 
-  nnet = NN(num_layers=1, input_dim=training_images.shape[1],
-            hidden_dim=hidden_dim, num_classes=10, batch_size=batch_size,
-            test_examples=testing_examples, nonlin='Tanh', update='natural',
-            alpha=backstitch_alpha)
+  load_pickle = args.load_pickle
+  if load_pickle:
+    pickle_in = open("model.pickle","rb")
+    nnet = pickle.load(pickle_in)
+  else:
+    nnet = NN(num_layers=1, input_dim=training_images.shape[1],
+              hidden_dim=hidden_dim, num_classes=10, batch_size=batch_size,
+              test_examples=testing_examples, nonlin='Tanh', update='natural',
+              alpha=backstitch_alpha)
   nnet.Train(training_examples)
 
 if __name__ == "__main__":
